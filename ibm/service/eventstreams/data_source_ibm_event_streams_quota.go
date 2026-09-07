@@ -15,6 +15,11 @@ import (
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 )
 
+const (
+	consumerByteRateKey = "consumer_byte_rate"
+	producerByteRateKey = "producer_byte_rate"
+)
+
 // A quota in an Event Streams service instance.
 // The ID is the CRN with the last two components "quota:entity".
 func DataSourceIBMEventStreamsQuota() *schema.Resource {
@@ -82,10 +87,6 @@ func dataSourceIBMEventStreamsQuotaRead(context context.Context, d *schema.Resou
 // entity name
 // Any error that occurred
 func getQuotaClientInstanceEntity(d *schema.ResourceData, meta interface{}) (QuotaClient, string, string, error) {
-	adminrestClient, err := meta.(conns.ClientSession).ESadminRestSession()
-	if err != nil {
-		return nil, "", "", err
-	}
 	instanceCRN := d.Get("resource_instance_id").(string)
 	if instanceCRN == "" { // importing
 		id := d.Id()
@@ -105,10 +106,29 @@ func getQuotaClientInstanceEntity(d *schema.ResourceData, meta interface{}) (Quo
 	if err != nil {
 		return nil, "", "", err
 	}
-	adminURL := instance.Extensions["kafka_http_url"].(string)
-	adminrestClient.SetServiceURL(adminURL)
-	wrappedClient := &quotaClientAdminRESTWrapper{
-		adminRESTClient: adminrestClient,
+
+	extensions, err := parseInstanceExtensions(instance, meta)
+	if err != nil {
+		return nil, "", "", err
+	}
+	if extensions.platformGeneration == 1 {
+		adminrestClient, err := meta.(conns.ClientSession).ESadminRestSession()
+		if err != nil {
+			return nil, "", "", err
+		}
+		adminrestClient.SetServiceURL(extensions.adminURL)
+		wrappedClient := &quotaClientAdminRESTWrapper{
+			adminRESTClient: adminrestClient,
+		}
+		return wrappedClient, instanceCRN, d.Get("entity").(string), nil
+	}
+	// else, assume gen2 and use Sarama
+	client, err := newSaramaAdminClient(instanceCRN, extensions, meta)
+	if err != nil {
+		return nil, "", "", err
+	}
+	wrappedClient := &quotaClientSaramaWrapper{
+		admin: client,
 	}
 	return wrappedClient, instanceCRN, d.Get("entity").(string), nil
 }

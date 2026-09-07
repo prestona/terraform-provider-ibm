@@ -85,11 +85,6 @@ func parseInstanceExtensions(instance *resourcecontrollerv2.ResourceInstance, me
 }
 
 func createSaramaAdminClient(d *schema.ResourceData, meta interface{}) (sarama.ClusterAdmin, *extensions, string, error) {
-	bxSession, err := meta.(conns.ClientSession).BluemixSession()
-	if err != nil {
-		log.Printf("[DEBUG] createSaramaAdminClient BluemixSession err %s", err)
-		return nil, nil, "", err
-	}
 	instanceCRN := d.Get("resource_instance_id").(string)
 	if len(instanceCRN) == 0 {
 		id := d.Id()
@@ -108,14 +103,25 @@ func createSaramaAdminClient(d *schema.ResourceData, meta interface{}) (sarama.C
 	if err != nil {
 		return nil, nil, "", err
 	}
-	log.Printf("[INFO] createSaramaAdminClient kafka_http_url is set to %s", ext.adminURL)
-	log.Printf("[INFO] createSaramaAdminClient kafka_brokers_sasl is set to %s", strings.Join(ext.bootstrapServers, ","))
-	var adminClient sarama.ClusterAdmin
-	var ok bool
-	if adminClient, ok = clientPool[instanceCRN]; ok {
-		log.Printf("[DEBUG] createSaramaAdminClient got client from pool for instance %s", instanceCRN)
-		return adminClient, ext, instanceCRN, nil
+	adminClient, err := newSaramaAdminClient(instanceCRN, ext, meta)
+	if err != nil {
+		return nil, nil, "", err
 	}
+	return adminClient, ext, instanceCRN, nil
+}
+
+func newSaramaAdminClient(instanceCRN string, ext *extensions, meta interface{}) (sarama.ClusterAdmin, error) {
+	if adminClient, ok := clientPool[instanceCRN]; ok {
+		log.Printf("[DEBUG] newSaramaAdminClient got client from pool for instance %s", instanceCRN)
+		return adminClient, nil
+	}
+	bxSession, err := meta.(conns.ClientSession).BluemixSession()
+	if err != nil {
+		log.Printf("[DEBUG] newSaramaAdminClient BluemixSession err %s", err)
+		return nil, err
+	}
+	log.Printf("[INFO] newSaramaAdminClient kafka_http_url is set to %s", ext.adminURL)
+	log.Printf("[INFO] newSaramaAdminClient kafka_brokers_sasl is set to %s", strings.Join(ext.bootstrapServers, ","))
 	config := sarama.NewConfig()
 	config.ClientID = fmt.Sprintf("terraform-provider-ibm/%s", version.Version)
 	config.Net.SASL.Enable = true
@@ -134,16 +140,16 @@ func createSaramaAdminClient(d *schema.ResourceData, meta interface{}) (sarama.C
 	config.Net.SASL.Mechanism = sarama.SASLTypeOAuth
 	config.Net.SASL.TokenProvider, err = newAccessTokenProvider(bxSession)
 	if err != nil {
-		return nil, nil, "", err
+		return nil, err
 	}
-	adminClient, err = sarama.NewClusterAdmin(ext.bootstrapServers, config)
+	adminClient, err := sarama.NewClusterAdmin(ext.bootstrapServers, config)
 	if err != nil {
-		log.Printf("[DEBUG] createSaramaAdminClient NewClusterAdmin err %s", err)
-		return nil, nil, "", err
+		log.Printf("[DEBUG] newSaramaAdminClient NewClusterAdmin err %s", err)
+		return nil, err
 	}
 	clientPool[instanceCRN] = adminClient
-	log.Printf("[INFO] createSaramaAdminClient instance %s 's client is initialized", instanceCRN)
-	return adminClient, ext, instanceCRN, nil
+	log.Printf("[INFO] newSaramaAdminClient instance %s's client is initialized", instanceCRN)
+	return adminClient, nil
 }
 
 func topicDetail2Config(topicConfigEntries map[string]*string) map[string]*string {
@@ -270,12 +276,12 @@ type quotaClientAdminRESTWrapper struct {
 
 func (c *quotaClientAdminRESTWrapper) newQuotaClientError(response *core.DetailedResponse, err error) error {
 	result := &quotaClientError{
-		notFound: response.StatusCode == http.StatusNotFound,
-		err:      err,
+		err: err,
 	}
 	if response != nil {
+		result.notFound = response.StatusCode == http.StatusNotFound
 		result.response = new(response.String())
-	} else {
+	} else if err != nil {
 		result.response = new(err.Error())
 	}
 	return result
@@ -326,4 +332,196 @@ func (c *quotaClientAdminRESTWrapper) DeleteQuota(ctx context.Context, name stri
 		return c.newQuotaClientError(response, err)
 	}
 	return nil
+}
+
+type quotaClientSaramaWrapper struct {
+	admin sarama.ClusterAdmin
+}
+
+func (c *quotaClientSaramaWrapper) convertNameToMatch(name string) (match string, matchType sarama.QuotaMatchType) {
+	if name == "default" {
+		return "", sarama.QuotaMatchDefault
+	}
+	return name, sarama.QuotaMatchExact
+}
+
+func (c *quotaClientSaramaWrapper) getController() (*sarama.Broker, error) {
+	controller, err := c.admin.Controller()
+	if err != nil {
+		return nil, &quotaClientError{
+			response: new(fmt.Sprintf("failed to get Kafka controller: %s", err.Error())),
+			err:      err,
+		}
+	}
+	return controller, nil
+}
+
+func (c *quotaClientSaramaWrapper) getQuotaEntries(name string) ([]sarama.DescribeClientQuotasEntry, error) {
+	match, matchType := c.convertNameToMatch(name)
+	quotaFilterComponent := sarama.QuotaFilterComponent{
+		EntityType: sarama.QuotaEntityUser,
+		Match:      match,
+		MatchType:  matchType,
+	}
+	entries, err := c.admin.DescribeClientQuotas([]sarama.QuotaFilterComponent{
+		quotaFilterComponent,
+	}, false)
+	if err != nil {
+		return nil, &quotaClientError{
+			response: new(fmt.Sprintf("failed to get details of quota: %q", name)),
+			err:      err,
+		}
+	}
+	return entries, err
+}
+
+func (c *quotaClientSaramaWrapper) alterQuota(name string, ops []sarama.ClientQuotasOp) error {
+	controller, err := c.getController()
+	if err != nil {
+		return err
+	}
+	entityName, matchType := c.convertNameToMatch(name)
+	response, err := controller.AlterClientQuotas(&sarama.AlterClientQuotasRequest{
+		Entries: []sarama.AlterClientQuotasEntry{
+			{
+				Entity: []sarama.QuotaEntityComponent{{
+					EntityType: sarama.QuotaEntityUser,
+					MatchType:  matchType,
+					Name:       entityName,
+				}},
+				Ops: ops,
+			},
+		},
+		Version: 1,
+	})
+	if err != nil {
+		return &quotaClientError{
+			response: new(fmt.Sprintf("failed to create/update quota: %q", name)),
+			err:      err,
+		}
+	}
+	for _, entry := range response.Entries {
+		if entry.ErrorMsg != nil && len(*entry.ErrorMsg) > 0 {
+			return &quotaClientError{
+				response: new(fmt.Sprintf("failed to create/update quota %q: %s", name, *entry.ErrorMsg)),
+				err:      errors.New(*entry.ErrorMsg),
+			}
+		} else if entry.ErrorCode != sarama.ErrNoError {
+			return &quotaClientError{
+				response: new(fmt.Sprintf("failed to create/update quota %q: error code %d", name, entry.ErrorCode)),
+				err:      fmt.Errorf("kafka API error code %d", entry.ErrorCode),
+			}
+		}
+	}
+	return nil
+}
+
+func (c *quotaClientSaramaWrapper) buildQuotaOptions(details QuotaDetails) []sarama.ClientQuotasOp {
+	ops := make([]sarama.ClientQuotasOp, 0)
+	if details.ConsumerByteRate != nil {
+		if *details.ConsumerByteRate >= 0 {
+			ops = append(ops, sarama.ClientQuotasOp{
+				Key:   consumerByteRateKey,
+				Value: float64(*details.ConsumerByteRate),
+			})
+		} else {
+			ops = append(ops, sarama.ClientQuotasOp{
+				Key:    consumerByteRateKey,
+				Remove: true,
+			})
+		}
+	}
+	if details.ProducerByteRate != nil {
+		if *details.ProducerByteRate >= 0 {
+			ops = append(ops, sarama.ClientQuotasOp{
+				Key:   producerByteRateKey,
+				Value: float64(*details.ProducerByteRate),
+			})
+		} else {
+			ops = append(ops, sarama.ClientQuotasOp{
+				Key:    producerByteRateKey,
+				Remove: true,
+			})
+		}
+	}
+	return ops
+}
+
+func (c *quotaClientSaramaWrapper) quotaNotFoundError(name string) *quotaClientError {
+	return &quotaClientError{
+		notFound: true,
+		response: new(fmt.Sprintf("quota %q not found", name)),
+		err:      errors.New("quota not found"),
+	}
+}
+
+func (c *quotaClientSaramaWrapper) CreateQuota(ctx context.Context, name string, details QuotaDetails) error {
+	entries, err := c.getQuotaEntries(name)
+	if err != nil {
+		return err
+	}
+
+	if len(entries) > 0 {
+		return &quotaClientError{
+			response: new(fmt.Sprintf("quota %q already exists", name)),
+			err:      errors.New("quota already exists"),
+		}
+	}
+
+	ops := c.buildQuotaOptions(details)
+	return c.alterQuota(name, ops)
+}
+
+func (c *quotaClientSaramaWrapper) GetQuota(ctx context.Context, name string) (*QuotaDetails, error) {
+	entries, err := c.getQuotaEntries(name)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(entries) == 0 {
+		return nil, c.quotaNotFoundError(name)
+	}
+
+	matchedQuota := entries[0]
+	details := QuotaDetails{}
+	if val, ok := matchedQuota.Values[consumerByteRateKey]; ok {
+		details.ConsumerByteRate = new(int64(val))
+	}
+	if val, ok := matchedQuota.Values[producerByteRateKey]; ok {
+		details.ProducerByteRate = new(int64(val))
+	}
+	return &details, nil
+}
+
+func (c *quotaClientSaramaWrapper) UpdateQuota(ctx context.Context, name string, newDetails QuotaDetails) error {
+	entries, err := c.getQuotaEntries(name)
+	if err != nil {
+		return err
+	}
+
+	if len(entries) == 0 {
+		return c.quotaNotFoundError(name)
+	}
+
+	ops := c.buildQuotaOptions(newDetails)
+	return c.alterQuota(name, ops)
+}
+
+func (c *quotaClientSaramaWrapper) DeleteQuota(ctx context.Context, name string) error {
+	entries, err := c.getQuotaEntries(name)
+	if err != nil {
+		return err
+	}
+
+	if len(entries) == 0 {
+		return c.quotaNotFoundError(name)
+	}
+
+	return c.alterQuota(name, []sarama.ClientQuotasOp{{
+		Key:    consumerByteRateKey,
+		Remove: true,
+	}, {
+		Key:    producerByteRateKey,
+		Remove: true,
+	}})
 }
