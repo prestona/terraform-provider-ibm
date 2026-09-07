@@ -1,4 +1,4 @@
-// Copyright IBM Corp. 2024 All Rights Reserved.
+// Copyright IBM Corp. 2024, 2026 All Rights Reserved.
 // Licensed under the Mozilla Public License v2.0
 
 package eventstreams
@@ -9,7 +9,6 @@ import (
 	"log"
 
 	"github.com/IBM-Cloud/terraform-provider-ibm/ibm/flex"
-	"github.com/IBM/eventstreams-go-sdk/pkg/adminrestv1"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
@@ -63,23 +62,21 @@ func resourceIBMEventStreamsQuotaCreate(context context.Context, d *schema.Resou
 		return tfErr.GetDiag()
 	}
 
-	createQuotaOptions := &adminrestv1.CreateQuotaOptions{}
-	createQuotaOptions.SetEntityName(entity)
+	createQuotaDetails := QuotaDetails{}
 	pbr := d.Get("producer_byte_rate").(int)
 	cbr := d.Get("consumer_byte_rate").(int)
 	if pbr == -1 && cbr == -1 {
 		return diag.FromErr(fmt.Errorf("Quota for %s cannot be created: producer_byte_rate and consumer_byte_rate are both -1 (no quota)", entity))
 	}
 	if pbr != -1 {
-		createQuotaOptions.SetProducerByteRate(int64(pbr))
+		createQuotaDetails.ProducerByteRate = new(int64(pbr))
 	}
 	if cbr != -1 {
-		createQuotaOptions.SetConsumerByteRate(int64(cbr))
+		createQuotaDetails.ConsumerByteRate = new(int64(cbr))
 	}
 
-	response, err := adminrestClient.CreateQuotaWithContext(context, createQuotaOptions)
-	if err != nil {
-		tfErr := flex.TerraformErrorf(err, fmt.Sprintf("CreateQuota failed with response: %s", response), "ibm_event_streams_quota", "create")
+	if err := adminrestClient.CreateQuota(context, entity, createQuotaDetails); err != nil {
+		tfErr := flex.TerraformErrorf(err, fmt.Sprintf("CreateQuota failed with response: %s", quotaClientResponse(err)), "ibm_event_streams_quota", "create")
 		log.Printf("[DEBUG]\n%s", tfErr.GetDebugMessage())
 		return tfErr.GetDiag()
 	}
@@ -96,16 +93,14 @@ func resourceIBMEventStreamsQuotaRead(context context.Context, d *schema.Resourc
 		return tfErr.GetDiag()
 	}
 
-	getQuotaOptions := &adminrestv1.GetQuotaOptions{}
-	getQuotaOptions.SetEntityName(entity)
-	quota, response, err := adminrestClient.GetQuotaWithContext(context, getQuotaOptions)
-	if err != nil || quota == nil {
+	quota, err := adminrestClient.GetQuota(context, entity)
+	if err != nil {
 		d.SetId("")
 		var tfErr *flex.TerraformProblem
-		if response != nil && response.StatusCode == 404 {
+		if quotaClientIsNotFound(err) {
 			tfErr = flex.TerraformErrorf(err, fmt.Sprintf("Quota for '%s' does not exist", entity), "ibm_event_streams_quota", "read")
 		} else {
-			tfErr = flex.TerraformErrorf(err, fmt.Sprintf("GetQuota failed with response: %s", response), "ibm_event_streams_quota", "read")
+			tfErr = flex.TerraformErrorf(err, fmt.Sprintf("GetQuota failed with response: %s", quotaClientResponse(err)), "ibm_event_streams_quota", "read")
 		}
 		log.Printf("[DEBUG]\n%s", tfErr.GetDebugMessage())
 		return tfErr.GetDiag()
@@ -129,14 +124,15 @@ func resourceIBMEventStreamsQuotaUpdate(context context.Context, d *schema.Resou
 			return tfErr.GetDiag()
 		}
 
-		updateQuotaOptions := &adminrestv1.UpdateQuotaOptions{}
-		updateQuotaOptions.SetEntityName(entity)
-		updateQuotaOptions.SetProducerByteRate(int64(d.Get("producer_byte_rate").(int)))
-		updateQuotaOptions.SetConsumerByteRate(int64(d.Get("consumer_byte_rate").(int)))
-
-		response, err := adminrestClient.UpdateQuotaWithContext(context, updateQuotaOptions)
-		if err != nil {
-			tfErr := flex.TerraformErrorf(err, fmt.Sprintf("UpdateQuota failed with response: %s", response), "ibm_event_streams_quota", "update")
+		updateQuotaDetails := QuotaDetails{}
+		if v, ok := d.GetOk("consumer_byte_rate"); ok {
+			updateQuotaDetails.ConsumerByteRate = new(int64(v.(int)))
+		}
+		if v, ok := d.GetOk("producer_byte_rate"); ok {
+			updateQuotaDetails.ProducerByteRate = new(int64(v.(int)))
+		}
+		if err := adminrestClient.UpdateQuota(context, entity, updateQuotaDetails); err != nil {
+			tfErr := flex.TerraformErrorf(err, fmt.Sprintf("UpdateQuota failed with response: %s", quotaClientResponse(err)), "ibm_event_streams_quota", "update")
 			log.Printf("[DEBUG]\n%s", tfErr.GetDebugMessage())
 			return tfErr.GetDiag()
 		}
@@ -152,12 +148,8 @@ func resourceIBMEventStreamsQuotaDelete(context context.Context, d *schema.Resou
 		return tfErr.GetDiag()
 	}
 
-	deleteQuotaOptions := &adminrestv1.DeleteQuotaOptions{}
-	deleteQuotaOptions.SetEntityName(entity)
-
-	response, err := adminrestClient.DeleteQuotaWithContext(context, deleteQuotaOptions)
-	if err != nil {
-		tfErr := flex.TerraformErrorf(err, fmt.Sprintf("DeleteQuota failed with response: %s", response), "ibm_event_streams_quota", "delete")
+	if err := adminrestClient.DeleteQuota(context, entity); err != nil {
+		tfErr := flex.TerraformErrorf(err, fmt.Sprintf("DeleteQuota failed with response: %s", quotaClientResponse(err)), "ibm_event_streams_quota", "delete")
 		log.Printf("[DEBUG]\n%s", tfErr.GetDebugMessage())
 		return tfErr.GetDiag()
 	}

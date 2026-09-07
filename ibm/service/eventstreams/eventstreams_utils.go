@@ -4,10 +4,13 @@
 package eventstreams
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"maps"
+	"net/http"
 	"slices"
 	"strings"
 
@@ -15,6 +18,7 @@ import (
 	"github.com/IBM-Cloud/terraform-provider-ibm/ibm/conns"
 	"github.com/IBM-Cloud/terraform-provider-ibm/ibm/flex"
 	"github.com/IBM-Cloud/terraform-provider-ibm/version"
+	"github.com/IBM/eventstreams-go-sdk/pkg/adminrestv1"
 	"github.com/IBM/go-sdk-core/v5/core"
 	"github.com/IBM/platform-services-go-sdk/resourcecontrollerv2"
 	"github.com/IBM/sarama"
@@ -212,4 +216,114 @@ func (tp *accessTokenProvider) Token() (*sarama.AccessToken, error) {
 		return nil, err
 	}
 	return &sarama.AccessToken{Token: token}, nil
+}
+
+type (
+	QuotaClient interface {
+		CreateQuota(ctx context.Context, name string, details QuotaDetails) error
+		GetQuota(ctx context.Context, name string) (*QuotaDetails, error)
+		UpdateQuota(ctx context.Context, name string, newDetails QuotaDetails) error
+		DeleteQuota(ctx context.Context, name string) error
+	}
+
+	QuotaDetails struct {
+		ProducerByteRate *int64
+		ConsumerByteRate *int64
+	}
+)
+
+type quotaClientError struct {
+	notFound bool
+	response *string
+	err      error
+}
+
+func (e *quotaClientError) Error() string {
+	return e.err.Error()
+}
+
+func quotaClientResponse(err error) string {
+	if quotaClientErr, ok := errors.AsType[*quotaClientError](err); ok {
+		if quotaClientErr.response != nil {
+			return *quotaClientErr.response
+		}
+		// Marshal error message into JSON object
+		data, err := json.Marshal(map[string]string{"message": err.Error()})
+		if err != nil {
+			return "{}"
+		}
+		return string(data)
+	}
+	return "{}"
+}
+
+func quotaClientIsNotFound(err error) bool {
+	if quotaClientErr, ok := errors.AsType[*quotaClientError](err); ok {
+		return quotaClientErr.notFound
+	}
+	return false
+}
+
+type quotaClientAdminRESTWrapper struct {
+	adminRESTClient *adminrestv1.AdminrestV1
+}
+
+func (c *quotaClientAdminRESTWrapper) newQuotaClientError(response *core.DetailedResponse, err error) error {
+	result := &quotaClientError{
+		notFound: response.StatusCode == http.StatusNotFound,
+		err:      err,
+	}
+	if response != nil {
+		result.response = new(response.String())
+	} else {
+		result.response = new(err.Error())
+	}
+	return result
+}
+
+func (c *quotaClientAdminRESTWrapper) CreateQuota(ctx context.Context, name string, details QuotaDetails) error {
+	response, err := c.adminRESTClient.CreateQuotaWithContext(ctx, &adminrestv1.CreateQuotaOptions{
+		EntityName:       &name,
+		ConsumerByteRate: details.ConsumerByteRate,
+		ProducerByteRate: details.ProducerByteRate,
+	})
+	if err != nil {
+		return c.newQuotaClientError(response, err)
+	}
+	return nil
+}
+
+func (c *quotaClientAdminRESTWrapper) GetQuota(ctx context.Context, name string) (*QuotaDetails, error) {
+	result, response, err := c.adminRESTClient.GetQuotaWithContext(ctx, &adminrestv1.GetQuotaOptions{
+		EntityName: &name,
+	})
+	if err != nil {
+		return nil, c.newQuotaClientError(response, err)
+	}
+	return &QuotaDetails{
+		ConsumerByteRate: result.ConsumerByteRate,
+		ProducerByteRate: result.ProducerByteRate,
+	}, nil
+}
+
+func (c *quotaClientAdminRESTWrapper) UpdateQuota(ctx context.Context, name string, newDetails QuotaDetails) error {
+	response, err := c.adminRESTClient.UpdateQuotaWithContext(ctx, &adminrestv1.UpdateQuotaOptions{
+		EntityName:       &name,
+		ConsumerByteRate: newDetails.ConsumerByteRate,
+		ProducerByteRate: newDetails.ProducerByteRate,
+	})
+	if err != nil {
+		return c.newQuotaClientError(response, err)
+	}
+	return nil
+}
+
+func (c *quotaClientAdminRESTWrapper) DeleteQuota(ctx context.Context, name string) error {
+	response, err := c.adminRESTClient.DeleteQuotaWithContext(ctx, &adminrestv1.DeleteQuotaOptions{
+		EntityName: &name,
+	})
+	if err != nil {
+		return c.newQuotaClientError(response, err)
+	}
+	return nil
 }

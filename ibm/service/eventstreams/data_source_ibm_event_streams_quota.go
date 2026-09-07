@@ -1,4 +1,4 @@
-// Copyright IBM Corp. 2024 All Rights Reserved.
+// Copyright IBM Corp. 2024, 2026 All Rights Reserved.
 // Licensed under the Mozilla Public License v2.0
 
 package eventstreams
@@ -11,7 +11,6 @@ import (
 
 	"github.com/IBM-Cloud/terraform-provider-ibm/ibm/conns"
 	"github.com/IBM-Cloud/terraform-provider-ibm/ibm/flex"
-	"github.com/IBM/eventstreams-go-sdk/pkg/adminrestv1"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 )
@@ -56,15 +55,13 @@ func dataSourceIBMEventStreamsQuotaRead(context context.Context, d *schema.Resou
 		return tfErr.GetDiag()
 	}
 
-	getQuotaOptions := &adminrestv1.GetQuotaOptions{}
-	getQuotaOptions.SetEntityName(entity)
-	quota, response, err := adminrestClient.GetQuotaWithContext(context, getQuotaOptions)
+	quota, err := adminrestClient.GetQuota(context, entity)
 	if err != nil {
 		var tfErr *flex.TerraformProblem
-		if response != nil && response.StatusCode == 404 {
+		if quotaClientIsNotFound(err) {
 			tfErr = flex.TerraformErrorf(err, fmt.Sprintf("Quota for '%s' does not exist", entity), "ibm_event_streams_quota", "read")
 		} else {
-			tfErr = flex.TerraformErrorf(err, fmt.Sprintf("GetQuota failed with response: %s", response), "ibm_event_streams_quota", "read")
+			tfErr = flex.TerraformErrorf(err, fmt.Sprintf("GetQuota failed with response: %s", quotaClientResponse(err)), "ibm_event_streams_quota", "read")
 		}
 		log.Printf("[DEBUG]\n%s", tfErr.GetDebugMessage())
 		return tfErr.GetDiag()
@@ -84,7 +81,7 @@ func dataSourceIBMEventStreamsQuotaRead(context context.Context, d *schema.Resou
 // CRN for the service instance
 // entity name
 // Any error that occurred
-func getQuotaClientInstanceEntity(d *schema.ResourceData, meta interface{}) (*adminrestv1.AdminrestV1, string, string, error) {
+func getQuotaClientInstanceEntity(d *schema.ResourceData, meta interface{}) (QuotaClient, string, string, error) {
 	adminrestClient, err := meta.(conns.ClientSession).ESadminRestSession()
 	if err != nil {
 		return nil, "", "", err
@@ -110,7 +107,10 @@ func getQuotaClientInstanceEntity(d *schema.ResourceData, meta interface{}) (*ad
 	}
 	adminURL := instance.Extensions["kafka_http_url"].(string)
 	adminrestClient.SetServiceURL(adminURL)
-	return adminrestClient, instanceCRN, d.Get("entity").(string), nil
+	wrappedClient := &quotaClientAdminRESTWrapper{
+		adminRESTClient: adminrestClient,
+	}
+	return wrappedClient, instanceCRN, d.Get("entity").(string), nil
 }
 
 func getQuotaID(instanceCRN string, entity string) string {
